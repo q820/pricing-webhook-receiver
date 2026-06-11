@@ -176,18 +176,33 @@ function forEachEvent(body, cb) {
   if (body.sample) drain(body.sample.value, "sample");
 }
 
-// Record one item occurrence. Keyed by field+wamid so a pricing event and the
-// status webhook for the same message (which share a wamid) stay separate. On a
-// repeat, log a [DUP] line with the gap since the previous copy — that cadence
-// separates a fixed fan-out (small, fixed count) from a retry loop (every N min).
+// The status/transition within a field. A message legitimately emits several
+// messages-field webhooks for the SAME wamid (sent, delivered, read) — those
+// are distinct events, not duplicates. So we key by this too: a real duplicate
+// is the same wamid AND same subtype arriving more than once.
+function eventSubtype(ev) {
+  if (ev && typeof ev === "object") {
+    if (ev.status) return String(ev.status); // sent / delivered / read
+    if (ev.trigger && ev.trigger.type) return String(ev.trigger.type); // message_delivered, ...
+  }
+  return "";
+}
+
+// Record one item occurrence. Keyed by field+wamid+subtype so that (a) a pricing
+// event and the status webhook for the same message stay separate, and (b) the
+// normal sent/delivered/read lifecycle is NOT mistaken for duplication. On a
+// repeat of the same (field,wamid,subtype), log a [DUP] line with the gap since
+// the previous copy — that cadence separates a fixed fan-out (small, fixed
+// count) from a retry loop (copies every N minutes).
 function recordEvent(ev, field, phone) {
   const id = eventKey(ev);
-  const mapKey = field + "|" + id;
+  const subtype = eventSubtype(ev);
+  const mapKey = field + "|" + id + "|" + subtype;
   const sec = nowSecond();
   fieldCounts.set(field, (fieldCounts.get(field) || 0) + 1);
   const rec = idIndex.get(mapKey);
   if (!rec) {
-    idIndex.set(mapKey, { key: id, field, phone, count: 1, firstSec: sec, lastSec: sec, gaps: [] });
+    idIndex.set(mapKey, { key: id, field, subtype, phone, count: 1, firstSec: sec, lastSec: sec, gaps: [] });
     return;
   }
   const gap = sec - rec.lastSec;
@@ -195,7 +210,7 @@ function recordEvent(ev, field, phone) {
   rec.gaps.push(gap);
   rec.lastSec = sec;
   console.log(
-    `[DUP] field=${field} wamid=${id} delivery#${rec.count} gapFromPrev=${gap}s totalSpan=${sec - rec.firstSec}s phone=${phone}`
+    `[DUP] field=${field} subtype=${subtype} wamid=${id} delivery#${rec.count} gapFromPrev=${gap}s totalSpan=${sec - rec.firstSec}s phone=${phone}`
   );
 }
 
@@ -340,6 +355,7 @@ app.get("/stats/events", (req, res) => {
       rows.push({
         key: rec.key,
         field: rec.field,
+        subtype: rec.subtype,
         phone: rec.phone,
         deliveries: rec.count,
         firstSeen: fmtPT(rec.firstSec),
