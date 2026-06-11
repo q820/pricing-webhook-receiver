@@ -97,10 +97,19 @@ function extractPhone(body) {
   );
 }
 
-// Count events across every shape we might receive in one POST.
+// Count events across every shape we might receive in one POST. Real WABA
+// webhooks carry items in value.events (pricing), value.statuses (delivery
+// statuses), or value.messages (inbound); the load tester uses value.events.
 function countEvents(body) {
   if (!body || typeof body !== "object") return 0;
-  const len = (v) => (v && Array.isArray(v.events) ? v.events.length : 0);
+  const len = (v) => {
+    if (!v) return 0;
+    let n = 0;
+    if (Array.isArray(v.events)) n += v.events.length;
+    if (Array.isArray(v.statuses)) n += v.statuses.length;
+    if (Array.isArray(v.messages)) n += v.messages.length;
+    return n;
+  };
   let total = 0;
   if (Array.isArray(body.entry)) {
     for (const entry of body.entry) {
@@ -127,12 +136,14 @@ function fingerprint(v) {
   return (h >>> 0).toString(36);
 }
 
-// The event's own identity if it has one (covers the common id shapes), else a
-// content fingerprint prefixed "hash:" so you can tell inferred keys apart.
+// The event's own identity if it has one (the wamid), else a content
+// fingerprint prefixed "hash:" so you can tell inferred keys apart. Pricing
+// events carry it at trigger.id; statuses/messages carry it at id.
 function eventKey(ev) {
   if (ev && typeof ev === "object") {
     const id =
-      ev.id ||
+      ev.id || // statuses[].id, messages[].id (wamid)
+      (ev.trigger && ev.trigger.id) || // pricing events[].trigger.id (wamid)
       ev.event_id ||
       ev.eventId ||
       ev.message_id ||
@@ -142,14 +153,18 @@ function eventKey(ev) {
   return "hash:" + fingerprint(ev);
 }
 
-// Walk every event across all envelope shapes, yielding (event, field, phone).
-// field comes from change.field — the webhook field (e.g. pricing, messages).
+// Walk every item across all envelope shapes, yielding (item, field, phone).
+// field comes from change.field (pricing, messages, …); items live in
+// value.events / value.statuses / value.messages depending on the field.
 function forEachEvent(body, cb) {
   if (!body || typeof body !== "object") return;
   const drain = (v, field) => {
-    if (v && Array.isArray(v.events)) {
-      const phone = (v.metadata && v.metadata.display_phone_number) || null;
-      for (const ev of v.events) cb(ev, field || "unknown", phone ? String(phone) : "unknown");
+    if (!v) return;
+    const phone = (v.metadata && v.metadata.display_phone_number) || null;
+    const ph = phone ? String(phone) : "unknown";
+    const f = field || "unknown";
+    for (const arr of [v.events, v.statuses, v.messages]) {
+      if (Array.isArray(arr)) for (const ev of arr) cb(ev, f, ph);
     }
   };
   if (Array.isArray(body.entry)) {
@@ -161,16 +176,18 @@ function forEachEvent(body, cb) {
   if (body.sample) drain(body.sample.value, "sample");
 }
 
-// Record one event occurrence. On a repeat key, log a [DUP] line with the gap
-// since the previous copy — that cadence is what separates a fixed fan-out
-// (small, fixed number of copies) from an open retry loop (copies every N min).
+// Record one item occurrence. Keyed by field+wamid so a pricing event and the
+// status webhook for the same message (which share a wamid) stay separate. On a
+// repeat, log a [DUP] line with the gap since the previous copy — that cadence
+// separates a fixed fan-out (small, fixed count) from a retry loop (every N min).
 function recordEvent(ev, field, phone) {
-  const key = eventKey(ev);
+  const id = eventKey(ev);
+  const mapKey = field + "|" + id;
   const sec = nowSecond();
   fieldCounts.set(field, (fieldCounts.get(field) || 0) + 1);
-  const rec = idIndex.get(key);
+  const rec = idIndex.get(mapKey);
   if (!rec) {
-    idIndex.set(key, { key, field, phone, count: 1, firstSec: sec, lastSec: sec, gaps: [] });
+    idIndex.set(mapKey, { key: id, field, phone, count: 1, firstSec: sec, lastSec: sec, gaps: [] });
     return;
   }
   const gap = sec - rec.lastSec;
@@ -178,7 +195,7 @@ function recordEvent(ev, field, phone) {
   rec.gaps.push(gap);
   rec.lastSec = sec;
   console.log(
-    `[DUP] key=${key} delivery#${rec.count} gapFromPrev=${gap}s totalSpan=${sec - rec.firstSec}s field=${field} phone=${phone}`
+    `[DUP] field=${field} wamid=${id} delivery#${rec.count} gapFromPrev=${gap}s totalSpan=${sec - rec.firstSec}s phone=${phone}`
   );
 }
 
